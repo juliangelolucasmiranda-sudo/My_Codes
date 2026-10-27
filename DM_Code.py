@@ -1,81 +1,90 @@
 import numpy as np
 from PIL import Image
 
-def gerar_dm_code_perfeito(texto, mask_id=1, tamanho_grid=21, escala_pixel=20):
-    # Cria a matriz base preenchida com um tom neutro de fundo (128)
-    matriz = np.full((tamanho_grid, tamanho_grid), 128, dtype=np.uint8)
+def calculate_dm_code_version(text_bytes_length):
+    """
+    Dynamically calculates the version and grid size based on text size.
+    Accounts for the optimized 2x2 header (4 pixels) + 3 vertex support markers = 7 reserved pixels.
+    """
+    versions = [
+        (1, 21, (21 * 21) - 7),  # Version 1: 21x21 (~434 useful bytes)
+        (2, 25, (25 * 25) - 7),  # Version 2: 25x25 (~618 useful bytes)
+        (3, 29, (29 * 29) - 7),  # Version 3: 29x29 (~834 useful bytes)
+        (4, 33, (33 * 33) - 7),  # Version 4: 33x33 (~1082 useful bytes)
+        (5, 37, (37 * 37) - 7)   # Version 5: 37x37 (~1362 useful bytes)
+    ]
     
-    # 1. BLINDAGEM ABSOLUTA: Cabeçalho e Marcador Principal (Canto Superior Esquerdo - 4x4) #Acho melhor reduzir para 2x2
-    # Esta área é sagrada e nunca será tocada pelas máscaras
-    for y in range(4):
-        for x in range(4):
-            if x == 0 and y == 0:
-                matriz[y, x] = 0     # Âncora preta pura
-            elif x == 3 or y == 3:
-                matriz[y, x] = 255   # Contorno de calibração branco
-            else:
-                matriz[y, x] = (x + y) * 30 % 255 # Gradiente interno de calibração
-                
-    # 2. Marcadores secundários nos cantos para estabilidade geométrica
-    matriz[0, tamanho_grid-1] = 0         # Canto superior direito (Preto)
-    matriz[tamanho_grid-1, 0] = 0         # Canto inferior esquerdo (Preto)
-    matriz[tamanho_grid-1, tamanho_grid-1] = 255 # Canto inferior direito (Branco)
-
-    # 3. Inserção dos dados do texto em varredura LTR (Esquerda para Direita)
-    max_bytes = tamanho_grid * tamanho_grid
-    bytes_texto = texto.encode('utf-8')[:max_bytes]
-    
-    idx = 0
-    for y in range(tamanho_grid):
-        for x in range(tamanho_grid):
-            # Identifica se o pixel pertence a uma zona reservada de marcação
-            is_canto_sup_esq = (y < 4 and x < 4)
-            is_canto_sup_dir = (y == 0 and x == tamanho_grid-1)
-            is_canto_inf_esq = (y == tamanho_grid-1 and x == 0)
-            is_canto_inf_dir = (y == tamanho_grid-1 and x == tamanho_grid-1)
+    for version, grid_size, capacity in versions:
+        if text_bytes_length <= capacity:
+            return version, grid_size
             
-            if is_canto_sup_esq or is_canto_sup_dir or is_canto_inf_esq or is_canto_inf_dir:
+    return 5, 37, (37 * 37) - 7
+
+def generate_optimized_dm_code(text, mask_id=1, bits_mode=256, pixel_scale=20):
+    text_bytes = text.encode('utf-8')
+    bytes_length = len(text_bytes)
+    
+    # Auto-sizing based on the new limit
+    version, grid_size = calculate_dm_code_version(bytes_length)
+    print(f"Text: {bytes_length} bytes | Version: v{version} ({grid_size}x{grid_size}) | Mask: {mask_id}")
+    
+    # Base matrix filled with neutral background tone (128)
+    matrix = np.full((grid_size, grid_size), 128, dtype=np.uint8)
+    
+    # 1. OPTIMIZED 2x2 HEADER (Top-Left Corner)
+    matrix[0, 0] = 255                  # (0,0) White Anchor
+    matrix[0, 1] = version * 50         # (0,1) Grid Version
+    matrix[1, 0] = mask_id * 80         # (1,0) Mask ID
+    matrix[1, 1] = 255 if bits_mode == 256 else 128  # (1,1) Data Depth / Bits Mode
+    
+    # 2. Secondary markers at the vertices
+    matrix[0, grid_size - 1] = 0              # Top-right corner (Black)
+    matrix[grid_size - 1, 0] = 0              # Bottom-left corner (Black)
+    matrix[grid_size - 1, grid_size - 1] = 255  # Bottom-right corner (White)
+
+    # 3. LTR data insertion (ignoring the 2x2 header and corners)
+    idx = 0
+    for y in range(grid_size):
+        for x in range(grid_size):
+            is_header_2x2 = (y < 2 and x < 2)
+            is_top_right = (y == 0 and x == grid_size - 1)
+            is_bottom_left = (y == grid_size - 1 and x == 0)
+            is_bottom_right = (y == grid_size - 1 and x == grid_size - 1)
+            
+            if is_header_2x2 or is_top_right or is_bottom_left or is_bottom_right:
                 continue
                 
-            if idx < len(bytes_texto):
-                matriz[y, x] = int(bytes_texto[idx])
+            if idx < bytes_length:
+                matrix[y, x] = int(text_bytes[idx])
                 idx += 1
 
-    # 4. APLICAÇÃO DE MÁSCARAS COM ZONA PROTEGIDA
-    matriz_mascarada = matriz.copy()
-    for y in range(tamanho_grid):
-        for x in range(tamanho_grid):
-            # Ignora totalmente as zonas de marcação na hora de mascarar
-            if (y < 4 and x < 4) or (y == 0 and x == tamanho_grid-1) or (y == tamanho_grid-1 and x == 0) or (y == tamanho_grid-1 and x == tamanho_grid-1):
+    # 4. MASK APPLICATION WITH PROTECTED ZONES (2x2 Header + Corners)
+    masked_matrix = matrix.copy()
+    for y in range(grid_size):
+        for x in range(grid_size):
+            if (y < 2 and x < 2) or (y == 0 and x == grid_size - 1) or (y == grid_size - 1 and x == 0) or (y == grid_size - 1 and x == grid_size - 1):
                 continue
             
-            # Máscaras estéticas melhoradas (evitam o efeito repetitivo chato)
             if mask_id == 1:
-                # Padrão de dispersão diagonal suave
                 if (x + y) % 3 == 0:
-                    matriz_mascarada[y, x] = min(255, int(matriz_mascarada[y, x]) + 25)
+                    masked_matrix[y, x] = min(255, int(masked_matrix[y, x]) + 25)
             elif mask_id == 2:
-                # Padrão ondulado / orgânico
                 if (x * y) % 5 == 0:
-                    matriz_mascarada[y, x] = max(0, int(matriz_mascarada[y, x]) - 35)
+                    masked_matrix[y, x] = max(0, int(masked_matrix[y, x]) - 35)
             elif mask_id == 3:
-                # Padrão cruzado central
                 if abs(x - y) % 4 == 0:
-                    matriz_mascarada[y, x] = min(255, int(matriz_mascarada[y, x]) + 30)
+                    masked_matrix[y, x] = min(255, int(masked_matrix[y, x]) + 30)
 
-    # 5. Upscaling visual limpo para renderização da imagem final
-    imagem_base = Image.fromarray(matriz_mascarada, mode='L')
-    imagem_ampliada = imagem_base.resize(
-        (tamanho_grid * escala_pixel, tamanho_grid * escala_pixel), 
+    # 5. Final rendering with upscaling
+    base_image = Image.fromarray(masked_matrix, mode='L')
+    enlarged_image = base_image.resize(
+        (grid_size * pixel_scale, grid_size * pixel_scale), 
         resample=Image.NEAREST
     )
-    
-    return imagem_ampliada
+    return enlarged_image
 
-# Testando a geração com a Máscara 1 corrigida
-mensagem_teste = "DM Code: A evolucao do QR tradicional! O que mudou nesta versão?Integridade do Marcador: O canto superior esquerdo e os cantos de suporte agora mantêm-se limpios, nítidos e totalmente protegidos contra qualquer interferência da máscara.Textura Fluida: A dispersão das máscaras foi ajustada para criar um padrão visual harmonioso de fundo, eliminando o aspeto de blocos repetidos que tinhas visto antes."
-dm_code_final = gerar_dm_code_perfeito(mensagem_teste, mask_id=1)
-
-# Salvando a nova imagem
-dm_code_final.save("dm_code_perfeito.png")
-print("Novo DM Code gerado com sucesso e sem falhas estruturais!")
+# Testing the optimized DM Code with 2x2 header and Mask 3
+test_message = "DM Code with optimized 2x2 header and high-density mask!"
+optimized_dm = generate_optimized_dm_code(test_message, mask_id=3)
+optimized_dm.save("dm_code_optimized.png")
+print("Optimized DM Code generated successfully!")
